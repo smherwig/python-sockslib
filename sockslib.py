@@ -1,214 +1,232 @@
 #!/usr/bin/env python
 
-import binascii
-import errno
-import getopt
-import select
+import asyncore
 import socket
 import struct
 import sys
 
-import event
 import ringbuffer
-import socketutils
 
-"""
-all big endian
+BLOCK_SIZE = 8192
 
-SOCKS 4
-=======
-client -> server
-    u8  version  [0x4]
-    u8  command  [0x01] = connect, [0x02] = bind
-    u16 port
-    u32 ip
-    var id      user id, terminated with 0x00 
+SOCKS_STATE_CLIENT_HELLO  = 1
+SOCKS_STATE_WAIT_CONNECT  = 2
+SOCKS_STATE_SERVER_HELLO  = 3
+SOCKS_STATE_RELAY         = 4
 
-server -> client
-    u8  unused  [0x00]
-    u8  status  0x5a = request granded, 0x5b = request reject or failed
-    u16 unused
-    u32 unused
+APP_STATE_CONNECTING = 1
+APP_STATE_CONNECTED  = 2
+APP_STATE_CLOSED     = 3
 
-SOCKS 4a
-========
-SOCKS 5
-=======
-    RFC1928, RFC1929
-"""
+SOCKS_CLIENT_HELLO_MIN_LENGTH = 9
+SOCKS_SERVER_HELLO_LENGTH = 8
 
-STATE_COMMAND = 1
-STATE_RELAY = 2
+SOCKS_CMD_CONNECT   = 0x01
+SOCKS_CMD_BIND      = 0x02
 
-CMD_SIZE = 9
-BUF_SIZE = 1024
+SOCKS_REQUEST_GRANTED = 0x5a
+SOCKS_REQUEST_DENIED = 0x5b
 
-CMD_CONNECT = 0x01
-CMD_BIND = 0x02
+class AppClientEndpoint(asyncore.dispatcher):
+    def __init__(self, host, port, socks_srv):
+        asyncore.dispatcher.__init__(self)
+        # The data from we read from the app_server is
+        # written here; the SOCKSEndpoint then reads from the
+        # ringbuf when relaying to the app_client.
+        self.ringbuf = ringbuffer.RingBuffer(BLOCK_SIZE * 2)
+        self.socks_srv = socks_srv
+        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.connect((host, port))
+        self.state = APP_STATE_CONNECTING
 
-STATUS_REQUEST_GRANTED = 0x5a
-
-#########################################
-# SOCKS Connection
-#
-#
-#  src --- sockserve -->  dst
-#########################################
-STATE_HANDSHAKE = 1
-STATE_SOURCE_CLOSE = 1
-
-SOCKS_HANDSHAKE_MIN_SIZE = 9
-
-
-def log_debug(fmt, *args):
-    ffmt = '[debug] %s' % fmt
-    line = ffmt % args
-    if not line.endswith('\n'):
-        line += '\n'
-    sys.stderr.write(line)
-
-
-# XXX: you can probably just do a socks4, and not worry about socks5
-class SOCKSConnection:
-    def __init__(self, sock, event_loop):
-        self.s_sock = sock
-        self.s_sock.setblocking(0)
-        self.event_loop = event_loop
-        self.state = STATE_HANDSHAKE
-        self.version  = None
-        self.cmd = None
-        self.d_sock = None
-        self.d_ipstr = None
-        self.d_port = None  
-        self.handshake_buf = bytearray()
-        # TODO: rename to outgoing and incoming, respectively.
-        self.s2d_buf = ringbuffer.RingBuffer(16348)
-        self.d2s_buf = ringbuffer.RingBuffer(16348)
-        # TODO: abstract the writes to the outgoing ringbuffer
-        # and the reads from the incoming ringbuffer, so that a module
-        # can override (perhaps by providing their own buffering).
-        # we'll start out with just the default nul module that just
-        # passes the data straight through:  that is, the _s_recv should
-        # look something like:
-        #
-        #
-        #   data = self.s_sock_recv(n)
-        #   # handle errors and closure
-        #   data = module.on_recv(data)
-        #   self.outgoing.write(data)
-        #
-        # simliarly the other send/recv functions
-
-    def _s_handshake(self):
-        n = len(self.handshake_buf)
-        data = self.s_sock.recv(SOCKS_HANDSHAKE_MIN_SIZE - n)
-        if not data:
-            self.state = STATE_SOURCE_CLOSE
-            return
-        self.handshake_buf += data
-
-        if len(self.handshake_buf) == SOCKS_HANDSHAKE_MIN_SIZE:
-            self.version, self.cmd, self.port, ip, self.user = \
-                    struct.unpack('>BBH4sB', self.handshake_buf)
-
-            self.d_ipstr = socket.inet_ntoa(ip)
-            log_debug('SOCKS handshake: version=%d, cmd=%02x, dst=%s:%d, user=%s' % \
-                    (self.version, self.cmd, self.d_ipstr, self.d_port, self.user)
-
-            self.d_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.d_sock.setblocking(0)
-            self.event_loop.add(self.d_sock, EVENT_READ | EVENT_WRITE, 
-                self.handle_dst)
-
-            self.event_loop.modify(self.s_sock, EVENT_READ, EVENT_WRITE, 
-                self.handle_src) 
-            self.state = STATE_RELAY
-
-    def _s_recv(self):
-        try:
-            n = min(self.s2d_buf.avail_write(), 8192)
-            data = self.s_sock.recv(n)
-        except socket.error as e:
-            if e.errno != errno.EAGAIN
-                self.state = STATE_ERROR
-        if not data:
-            self.state = STATE_SOURCE_CLOSE
-        else:
-            self.s2d_buf.write(data)
-
-    def _s_send(self):
-        n = min(self.d2s_buf.avail_read(), 8192)
-        data = self.d2s_buf.peek(n)
-        try:
-            m = self.s_sock.send(data)
-        except socket.error as e:
-            if e.errno != errno.EAGAIN
-                self.state = STATE_ERROR
+    def _relay_to_app_server(self):
+        print 'app: relay_to_app_server'
+        n = self.socks_srv.ringbuf.avail_read()
+        m = min(BLOCK_SIZE, n)
         if m > 0:
-            _ = self.d2s_buf.read(m)
+            data = self.socks_srv.ringbuf.peek(m)
+            print 'app: relay_to_app_server: n=%d, m=%d, data="%s"' % (n, m, data)
+            nsent = self.send(data)
+            print 'app: relay_to_app_server: want %d, sent %d' % (m, nsent)
+            if nsent:
+                _ = self.socks_srv.ringbuf.read(nsent)
 
-    def s_handle(self, revent):
-        if self.state == STATE_HANDSHAKE:
-            self._do_handshake()
-        if self.state == STATE_RELAY:
-            self._do_relay()
-
-        if self.state == STATE_SOURCE_CLOSE or self.state == STATE_ERROR:
-            # TODO: destroy client
-            return
-
-        # TODO: reschedule in event_loop      
-
-    def _d_recv(self):
-        try:
-            n = min(self.d2s_buf.avail_write(), 8192)
-            data = self.s_sock.recv(n)
-        except socket.error as e:
-            if e.errno != errno.EAGAIN
-                self.state = STATE_ERROR
+    def _relay_to_socks_server(self):
+        print 'app: relay_to_socks_server'
+        n = self.ringbuf.avail_write()
+        m = min(BLOCK_SIZE, n)
+        data = self.recv(m)
         if not data:
-            self.state = STATE_SOURCE_CLOSE
+            return
+        self.ringbuf.write(data)
+
+    def readable(self):
+        if self.state == APP_STATE_CONNECTING:
+            return True
+        elif self.state == APP_STATE_CONNECTED and self.ringbuf.avail_write() > 0:
+            return True
         else:
-            self.d2s_buf.write(data)
+            return False
+    
+    def writable(self):
+        if self.state == APP_STATE_CONNECTING:
+            return True
+        elif self.state == APP_STATE_CONNECTED and self.socks_srv.ringbuf.avail_read() > 0:
+            return True
+        else:
+            return False
 
-    def _d_send(self):
-        n = min(self.s2d_buf.avail_read(), 8192)
-        data = self.s2d_buf.peek(n)
-        try:
-            m = self.s_sock.send(data)
-        except socket.error as e:
-            if e.errno != errno.EAGAIN
-                self.state = STATE_ERROR
-        if m > 0:
-            _ = self.s2d_buf.read(m)
+    def handle_connect(self):
+        print 'app: handle_connect'
+        self.state = APP_STATE_CONNECTED
 
-    def d_handle(self, revent):
-        if revent = EVENT_READ:
-            data = self.d_sock.recv(1024)
+    #def handle_error(self):
+    #    print 'app: error'
+    #    self.state = APP_STATE_CLOSED
 
-        elif revent == EVENT_WRITE:
-            
-            pass
+    def handle_read(self):
+        if self.state == APP_STATE_CONNECTED:
+            self._relay_to_socks_server()
+
+    def handle_write(self):
+        if self.state == APP_STATE_CONNECTED:
+            self._relay_to_app_server()
 
 
-def SOCKSServer:
-    def __init__(self, port, event_loop):
-        self.sock = socketutils.tcp4server(port, blocking=False)
-        self.event_loop = event_loop
+class SOCKSServerEndpoint(asyncore.dispatcher):
+    def __init__(self, sock):
+        asyncore.dispatcher.__init__(self, sock)
+        # used for the client handshake
+        self.hsbuf = bytearray()
+        # data that we read from app_client is written here.  We handle the
+        # handshake data; after the handshake is done, the AppEndpoint reads
+        # from the ringbuf everytime it needs to send.
+        self.ringbuf = ringbuffer.RingBuffer(BLOCK_SIZE * 2)
+        self.state = SOCKS_STATE_CLIENT_HELLO
+        self.socks_version = None
+        self.socks_command = None
+        self.user = None
+        self.app = None
+        self.app_port = None
+        self.app_ipstr = None
 
-    def serve(self):
-        c, ai = self.sock.accept()
-        log_debug('new connection from %s:%d' % ai)
-        conn = SOCKSConnection(c)
-        self.event_loop.add(c, EVENT_READ, conn.handle_src)
+    def _make_server_hello(self, status):
+            self.hsbuf = struct.pack('BBHI', 0, status, 0, 0)
 
-def main(argv):
-    port = int(argv[1])
-    event_loop = event.EventLoop()
-    server = SOCKSServer(port, event_loop)
-    event_loop.add(server.sock, event.EVENT_READ, server.serve)
-    event_loop.loop()
+    def _recv_client_hello(self):
+        print 'srv: recv_client_hello'
+        data = self.recv(BLOCK_SIZE)
+        if not data:
+            return
+        self.hsbuf += data
+        if len(self.hsbuf) >= SOCKS_CLIENT_HELLO_MIN_LENGTH and self.hsbuf.find('\x00', SOCKS_CLIENT_HELLO_MIN_LENGTH - 1) != -1:
+            print 'srv: hsbuf length=%d' % len(self.hsbuf)
+            self.socks_version, self.socks_command, self.app_port, self.app_ipstr = struct.unpack('>BBH4s', self.hsbuf[:8])
+            i = self.hsbuf.find('\x00', SOCKS_CLIENT_HELLO_MIN_LENGTH - 1)
+            self.user = self.hsbuf[8:i]
+            self.app_ipstr = socket.inet_ntoa(self.app_ipstr)
+
+            print 'srv: socks_version=%d' % self.socks_version
+            print 'srv: socks_command=%d' % self.socks_command
+            print 'srv: app_port=%d' % self.app_port
+            print 'srv: ipstr=%s' % self.app_ipstr
+
+            self.state = SOCKS_STATE_WAIT_CONNECT
+            self.app = AppClientEndpoint(self.app_ipstr, self.app_port, self)
+
+    def _send_server_hello(self):
+        print 'srv: send_server_hello'
+        n = self.send(self.hsbuf)
+        if n == len(self.hsbuf):
+            print 'srv: state -> SOCKS_STATE_RELAY'
+            self.state = SOCKS_STATE_RELAY
+        self.hsbuf = self.hsbuf[n:]
+
+    def _relay_to_app_server(self):
+        print 'srv: relay_to_app_server'
+        n = self.ringbuf.avail_write()
+        m = min(BLOCK_SIZE, n)
+        data = self.recv(m)
+        print 'srv: relay_to_app_server: want %d, got %d' % (m, len(data))
+        if not data:
+            return
+        self.ringbuf.write(data)
+
+    def _relay_to_app_client(self):
+        print 'srv: relay_to_app_client'
+        n = self.app.ringbuf.avail_read()
+        m = min(BLOCK_SIZE, n)
+        data = self.app.ringbuf.peek(m)
+        nsent = self.send(data)
+        if nsent:
+            _ = self.app.ringbuf.read(nsent)
+
+    def readable(self):
+        if self.state == SOCKS_STATE_CLIENT_HELLO:
+            return True
+        elif self.state == SOCKS_STATE_RELAY and self.ringbuf.avail_write() > 0:
+            return True
+        else:
+            return False
+        
+    def writable(self):
+        if self.state in (SOCKS_STATE_WAIT_CONNECT, SOCKS_STATE_SERVER_HELLO):
+            return True
+        elif self.state == SOCKS_STATE_RELAY and self.app.ringbuf.avail_read() > 0:
+            return True
+        else:
+            return False
+
+    def handle_close(self):
+        print 'srv: handle_close'
+        asyncore.dispatcher.handle_close(self)
+
+    def handle_read(self):
+        print 'srv: handle_read'
+        if self.state == SOCKS_STATE_CLIENT_HELLO:
+            self._recv_client_hello()
+        elif self.state == SOCKS_STATE_RELAY:
+            self._relay_to_app_server()
+
+    def handle_write(self):
+        print 'srv: handle_write'
+        if self.state == SOCKS_STATE_WAIT_CONNECT:
+            if self.app.state == APP_STATE_CONNECTED:
+                self.state = SOCKS_STATE_SERVER_HELLO
+                print 'A'
+                self._make_server_hello(SOCKS_REQUEST_GRANTED)
+                self._send_server_hello()
+            elif self.app.state == APP_STATE_CLOSED:
+                self.state = SOCKS_STATE_SERVER_HELLO
+                print 'B'
+                self._make_server_hello(SOCKS_REQUEST_DENIED)
+                self._send_server_hello()
+        elif self.state == SOCKS_STATE_RELAY:
+            self._relay_to_app_client()
+
+class SOCKSServer(asyncore.dispatcher):
+    def __init__(self, host, port):
+        asyncore.dispatcher.__init__(self)
+        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.set_reuse_addr()
+        self.bind((host, port))
+        self.listen(5)
+
+    def handle_accept(self):
+        pair = self.accept()
+        if pair is not None:
+            sock, addr = pair
+            print 'listener: Incoming connection from %s' % repr(addr)
+            SOCKSServerEndpoint(sock)
+
+    def readable(self):
+        return True
+
+    def writeable(self):
+        return False
 
 
 if __name__ == '__main__':
-    main(sys.argv)
+    import sys
+    SOCKSServer('', int(sys.argv[1]))
+    asyncore.loop()
