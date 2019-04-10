@@ -9,10 +9,12 @@ import ringbuffer
 
 BLOCK_SIZE = 8192
 
-SOCKS_STATE_CLIENT_HELLO  = 1
-SOCKS_STATE_WAIT_CONNECT  = 2
-SOCKS_STATE_SERVER_HELLO  = 3
-SOCKS_STATE_RELAY         = 4
+SOCKS_STATE_CLIENT_HELLO        = 1
+SOCKS_STATE_WAIT_CONNECT        = 2
+SOCKS_STATE_SERVER_HELLO_OPEN   = 3
+SOCKS_STATE_SERVER_HELLO_CLOSE  = 4
+SOCKS_STATE_RELAY               = 5
+SOCKS_STATE_CLOSE               = 6
 
 APP_STATE_CONNECTING = 1
 APP_STATE_CONNECTED  = 2
@@ -29,6 +31,7 @@ SOCKS_REQUEST_DENIED = 0x5b
 
 class AppClientEndpoint(asyncore.dispatcher):
     def __init__(self, host, port, socks_srv):
+        print 'here'
         asyncore.dispatcher.__init__(self)
         # The data from we read from the app_server is
         # written here; the SOCKSEndpoint then reads from the
@@ -36,8 +39,12 @@ class AppClientEndpoint(asyncore.dispatcher):
         self.ringbuf = ringbuffer.RingBuffer(BLOCK_SIZE * 2)
         self.socks_srv = socks_srv
         self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.connect((host, port))
         self.state = APP_STATE_CONNECTING
+        try:
+            self.connect((host, port))
+        except socket.error as e:
+            self.state = APP_STATE_CLOSED
+            self.close()
 
     def _relay_to_app_server(self):
         print 'app: relay_to_app_server'
@@ -80,9 +87,14 @@ class AppClientEndpoint(asyncore.dispatcher):
         print 'app: handle_connect'
         self.state = APP_STATE_CONNECTED
 
-    #def handle_error(self):
-    #    print 'app: error'
-    #    self.state = APP_STATE_CLOSED
+    def handle_error(self):
+        print 'app: error'
+        self.handle_close()
+
+    def handle_close(self):
+        print 'app: close'
+        self.state = APP_STATE_CLOSED
+        self.close()
 
     def handle_read(self):
         if self.state == APP_STATE_CONNECTED:
@@ -98,9 +110,7 @@ class SOCKSServerEndpoint(asyncore.dispatcher):
         asyncore.dispatcher.__init__(self, sock)
         # used for the client handshake
         self.hsbuf = bytearray()
-        # data that we read from app_client is written here.  We handle the
-        # handshake data; after the handshake is done, the AppEndpoint reads
-        # from the ringbuf everytime it needs to send.
+        # data we read from app_client, headed toward the app_server
         self.ringbuf = ringbuffer.RingBuffer(BLOCK_SIZE * 2)
         self.state = SOCKS_STATE_CLIENT_HELLO
         self.socks_version = None
@@ -111,7 +121,7 @@ class SOCKSServerEndpoint(asyncore.dispatcher):
         self.app_ipstr = None
 
     def _make_server_hello(self, status):
-            self.hsbuf = struct.pack('BBHI', 0, status, 0, 0)
+        self.hsbuf = struct.pack('BBHI', 0, status, 0, 0)
 
     def _recv_client_hello(self):
         print 'srv: recv_client_hello'
@@ -119,11 +129,13 @@ class SOCKSServerEndpoint(asyncore.dispatcher):
         if not data:
             return
         self.hsbuf += data
-        if len(self.hsbuf) >= SOCKS_CLIENT_HELLO_MIN_LENGTH and self.hsbuf.find('\x00', SOCKS_CLIENT_HELLO_MIN_LENGTH - 1) != -1:
-            print 'srv: hsbuf length=%d' % len(self.hsbuf)
-            self.socks_version, self.socks_command, self.app_port, self.app_ipstr = struct.unpack('>BBH4s', self.hsbuf[:8])
-            i = self.hsbuf.find('\x00', SOCKS_CLIENT_HELLO_MIN_LENGTH - 1)
-            self.user = self.hsbuf[8:i]
+        if len(self.hsbuf) >= SOCKS_CLIENT_HELLO_MIN_LENGTH:
+            user_end = self.hsbuf.find('\x00', SOCKS_CLIENT_HELLO_MIN_LENGTH - 1)
+            if user_end == -1:
+                return
+            self.socks_version, self.socks_command, self.app_port, \
+                    self.app_ipstr = struct.unpack('>BBH4s', self.hsbuf[:8])
+            self.user = self.hsbuf[8:user_end]
             self.app_ipstr = socket.inet_ntoa(self.app_ipstr)
 
             print 'srv: socks_version=%d' % self.socks_version
@@ -134,12 +146,19 @@ class SOCKSServerEndpoint(asyncore.dispatcher):
             self.state = SOCKS_STATE_WAIT_CONNECT
             self.app = AppClientEndpoint(self.app_ipstr, self.app_port, self)
 
-    def _send_server_hello(self):
-        print 'srv: send_server_hello'
+    def _send_server_hello_open(self):
+        print 'srv: send_server_hello_open'
         n = self.send(self.hsbuf)
         if n == len(self.hsbuf):
-            print 'srv: state -> SOCKS_STATE_RELAY'
             self.state = SOCKS_STATE_RELAY
+        self.hsbuf = self.hsbuf[n:]
+
+    def _send_server_hello_close(self):
+        print 'srv: send_server_hello_close'
+        n = self.send(self.hsbuf)
+        if n == len(self.hsbuf):
+            self.state = SOCKS_STATE_CLOSE
+            self.close()
         self.hsbuf = self.hsbuf[n:]
 
     def _relay_to_app_server(self):
@@ -170,7 +189,8 @@ class SOCKSServerEndpoint(asyncore.dispatcher):
             return False
         
     def writable(self):
-        if self.state in (SOCKS_STATE_WAIT_CONNECT, SOCKS_STATE_SERVER_HELLO):
+        if self.state in (SOCKS_STATE_WAIT_CONNECT,
+                SOCKS_STATE_SERVER_HELLO_CLOSE, SOCKS_STATE_SERVER_HELLO_OPEN):
             return True
         elif self.state == SOCKS_STATE_RELAY and self.app.ringbuf.avail_read() > 0:
             return True
@@ -192,17 +212,16 @@ class SOCKSServerEndpoint(asyncore.dispatcher):
         print 'srv: handle_write'
         if self.state == SOCKS_STATE_WAIT_CONNECT:
             if self.app.state == APP_STATE_CONNECTED:
-                self.state = SOCKS_STATE_SERVER_HELLO
-                print 'A'
+                self.state = SOCKS_STATE_SERVER_HELLO_OPEN
                 self._make_server_hello(SOCKS_REQUEST_GRANTED)
-                self._send_server_hello()
+                self._send_server_hello_open()
             elif self.app.state == APP_STATE_CLOSED:
-                self.state = SOCKS_STATE_SERVER_HELLO
-                print 'B'
+                self.state = SOCKS_STATE_SERVER_HELLO_CLOSE
                 self._make_server_hello(SOCKS_REQUEST_DENIED)
-                self._send_server_hello()
+                self._send_server_hello_close()
         elif self.state == SOCKS_STATE_RELAY:
             self._relay_to_app_client()
+
 
 class SOCKSServer(asyncore.dispatcher):
     def __init__(self, host, port):
