@@ -107,8 +107,9 @@ class AppClientEndpoint(asyncore.dispatcher):
 
 
 class SOCKSServerEndpoint(asyncore.dispatcher):
-    def __init__(self, sock):
+    def __init__(self, sock, app_class=AppClientEndpoint):
         asyncore.dispatcher.__init__(self, sock)
+        self.app_class = app_class
         # used for the client handshake
         self.hsbuf = bytearray()
         # data we read from app_client, headed toward the app_server
@@ -139,7 +140,7 @@ class SOCKSServerEndpoint(asyncore.dispatcher):
             return
         self.app_domain = self.hsbuf[:domain_end]
         self.state = SOCKS_STATE_WAIT_CONNECT
-        self.app = AppClientEndpoint(self.app_domain, self.app_port, self)
+        self.app = app_class(self.app_domain, self.app_port, self)
 
     def _recv_client_hello(self):
         print 'srv: recv_client_hello'
@@ -176,10 +177,10 @@ class SOCKSServerEndpoint(asyncore.dispatcher):
                     self.app_domain = str(self.hsbuf[:domain_end])
                     print self.app_domain
                     self.state = SOCKS_STATE_WAIT_CONNECT
-                    self.app = AppClientEndpoint(self.app_domain, self.app_port, self)
+                    self.app = self.app_class(self.app_domain, self.app_port, self)
             else:
                 self.state = SOCKS_STATE_WAIT_CONNECT
-                self.app = AppClientEndpoint(self.app_ipstr, self.app_port, self)
+                self.app = self.app_class(self.app_ipstr, self.app_port, self)
 
     def _send_server_hello_open(self):
         print 'srv: send_server_hello_open'
