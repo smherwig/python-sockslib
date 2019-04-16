@@ -9,12 +9,13 @@ import ringbuffer
 
 BLOCK_SIZE = 8192
 
-SOCKS_STATE_CLIENT_HELLO        = 1
-SOCKS_STATE_WAIT_CONNECT        = 2
-SOCKS_STATE_SERVER_HELLO_OPEN   = 3
-SOCKS_STATE_SERVER_HELLO_CLOSE  = 4
-SOCKS_STATE_RELAY               = 5
-SOCKS_STATE_CLOSE               = 6
+SOCKS_STATE_CLIENT_HELLO            = 1
+SOCKS_STATE_CLIENT_HELLO_DOMAINNAME = 2
+SOCKS_STATE_WAIT_CONNECT            = 3
+SOCKS_STATE_SERVER_HELLO_OPEN       = 4
+SOCKS_STATE_SERVER_HELLO_CLOSE      = 5
+SOCKS_STATE_RELAY                   = 6
+SOCKS_STATE_CLOSE                   = 7
 
 APP_STATE_CONNECTING = 1
 APP_STATE_CONNECTED  = 2
@@ -119,9 +120,26 @@ class SOCKSServerEndpoint(asyncore.dispatcher):
         self.app = None
         self.app_port = None
         self.app_ipstr = None
+        self.app_domain = None
 
     def _make_server_hello(self, status):
         self.hsbuf = struct.pack('BBHI', 0, status, 0, 0)
+
+
+    def _recv_client_hello_domainname(self):
+        print 'srv: recv_client_hello_domainname'
+        data = self.recv(BLOCK_SIZE)
+        print data
+        if not data:
+            return
+
+        self.hsbuf += data
+        domain_end = self.hsbuf.find('\x00')
+        if domain_end == -1:
+            return
+        self.app_domain = self.hsbuf[:domain_end]
+        self.state = SOCKS_STATE_WAIT_CONNECT
+        self.app = AppClientEndpoint(self.app_domain, self.app_port, self)
 
     def _recv_client_hello(self):
         print 'srv: recv_client_hello'
@@ -143,8 +161,25 @@ class SOCKSServerEndpoint(asyncore.dispatcher):
             print 'srv: app_port=%d' % self.app_port
             print 'srv: ipstr=%s' % self.app_ipstr
 
-            self.state = SOCKS_STATE_WAIT_CONNECT
-            self.app = AppClientEndpoint(self.app_ipstr, self.app_port, self)
+            if self.socks_version != 4:
+                print 'error'
+                # TODO: error
+                pass
+
+            if self.app_ipstr.startswith('0.0.0.'):
+                self.hsbuf = self.hsbuf[user_end+1:]
+                domain_end = self.hsbuf.find('\x00')
+                if domain_end == -1:
+                    self.state = SOCKS_STATE_CLIENT_HELLO_DOMAINNAME
+                    return
+                else:
+                    self.app_domain = str(self.hsbuf[:domain_end])
+                    print self.app_domain
+                    self.state = SOCKS_STATE_WAIT_CONNECT
+                    self.app = AppClientEndpoint(self.app_domain, self.app_port, self)
+            else:
+                self.state = SOCKS_STATE_WAIT_CONNECT
+                self.app = AppClientEndpoint(self.app_ipstr, self.app_port, self)
 
     def _send_server_hello_open(self):
         print 'srv: send_server_hello_open'
@@ -181,7 +216,7 @@ class SOCKSServerEndpoint(asyncore.dispatcher):
             _ = self.app.ringbuf.read(nsent)
 
     def readable(self):
-        if self.state == SOCKS_STATE_CLIENT_HELLO:
+        if self.state in (SOCKS_STATE_CLIENT_HELLO, SOCKS_STATE_CLIENT_HELLO_DOMAINNAME):
             return True
         elif self.state == SOCKS_STATE_RELAY and self.ringbuf.avail_write() > 0:
             return True
@@ -202,9 +237,11 @@ class SOCKSServerEndpoint(asyncore.dispatcher):
         asyncore.dispatcher.handle_close(self)
 
     def handle_read(self):
-        print 'srv: handle_read'
+        print 'srv: handle_read (state=%d)' % self.state
         if self.state == SOCKS_STATE_CLIENT_HELLO:
             self._recv_client_hello()
+        elif self.state == SOCKS_STATE_CLIENT_HELLO_DOMAINNAME:
+            self._recv_client_hello_domainname()
         elif self.state == SOCKS_STATE_RELAY:
             self._relay_to_app_server()
 
